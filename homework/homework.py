@@ -95,3 +95,162 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+import gzip
+import json
+import os
+import pickle
+import zipfile
+from glob import glob
+
+import pandas as pd  # type: ignore
+from sklearn.compose import ColumnTransformer  # type: ignore
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif  # type: ignore
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from sklearn.model_selection import GridSearchCV  # type: ignore
+from sklearn.pipeline import Pipeline  # type: ignore
+from sklearn.preprocessing import OneHotEncoder, StandardScaler  # type: ignore
+from sklearn.svm import SVC  # type: ignore
+
+#Se cargan los datos del dataset
+def load_dataset(input_folder):
+    dataframes = []
+    zip_files = glob(f"{input_folder}/*")
+    
+    for zip_path in zip_files:
+        with zipfile.ZipFile(zip_path, mode="r") as zip_file:
+            for filename in zip_file.namelist():
+                with zip_file.open(filename) as file:
+                    dataframes.append(pd.read_csv(file, sep=",", index_col=0))
+    
+    return dataframes
+
+#Se crea la carpeta de los resultados
+def create_output_folder(output_folder):
+    if os.path.exists(output_folder):
+        for file in glob(f"{output_folder}/*"):
+            os.remove(file)
+        os.rmdir(output_folder)
+    os.makedirs(output_folder)
+
+#Se realiza el preprocesamiento de los datos
+def preprocess_dataframe(df):
+    """Paso 1"""
+    df = df.copy()
+    df = df.rename(columns={"default payment next month": "default"})
+    df = df.loc[df["MARRIAGE"] != 0]
+    df = df.loc[df["EDUCATION"] != 0]
+    df["EDUCATION"] = df["EDUCATION"].apply(lambda x: 4 if x >= 4 else x)
+    return df.dropna()
+
+#Parte del preprocesamiento de los datos
+def split_features_target(df):
+    """Paso 2"""
+    return df.drop(columns=["default"]), df["default"]
+# Se construye el pipeline del modelo de clasificación
+def build_pipeline():
+    """Paso 3"""
+    categorical_features = ["SEX", "EDUCATION", "MARRIAGE"]
+    numerical_features = [
+        "LIMIT_BAL", "AGE", "PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6",
+        "BILL_AMT1", "BILL_AMT2", "BILL_AMT3", "BILL_AMT4", "BILL_AMT5", "BILL_AMT6",
+        "PAY_AMT1", "PAY_AMT2", "PAY_AMT3", "PAY_AMT4", "PAY_AMT5", "PAY_AMT6",
+    ]
+    
+    preprocessing = ColumnTransformer(
+        [
+            ("categorical", OneHotEncoder(handle_unknown="ignore"), categorical_features),
+            ("scaling", StandardScaler(with_mean=True, with_std=True), numerical_features),
+        ],
+    )
+    
+    return Pipeline(
+        [
+            ("preprocessing", preprocessing),
+            ("pca", PCA()),
+            ("feature_selection", SelectKBest(score_func=f_classif)),
+            ("classifier", SVC(kernel="rbf", random_state=42)),
+        ]
+    )
+
+# Se configura el estimador con los hiperparámetros
+def configure_estimator(pipeline):
+    hyperparameters = {
+        "pca__n_components": [20, 21],
+        "feature_selection__k": [12],
+        "classifier__kernel": ["rbf"],
+        "classifier__gamma": [0.1],
+    }
+    
+    return GridSearchCV(
+        pipeline,
+        hyperparameters,
+        cv=10,
+        n_jobs=-1,
+        verbose=2,
+        refit=True,
+    )
+
+# Se salva el modelo
+def save_model(file_path, model):
+    create_output_folder("files/models/")
+    with gzip.open(file_path, "wb") as file:
+        pickle.dump(model, file)
+
+# Computar métricas
+def compute_metrics(dataset_label, true_labels, predicted_labels):
+    return {
+        "type": "metrics",
+        "dataset": dataset_label,
+        "precision": precision_score(true_labels, predicted_labels, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(true_labels, predicted_labels),
+        "recall": recall_score(true_labels, predicted_labels, zero_division=0),
+        "f1_score": f1_score(true_labels, predicted_labels, zero_division=0),
+    }
+
+# Se computa la matriz de confusión
+def compute_confusion_matrix(dataset_label, true_labels, predicted_labels):
+    cm = confusion_matrix(true_labels, predicted_labels)
+    return {
+        "type": "cm_matrix",
+        "dataset": dataset_label,
+        "true_0": {"predicted_0": int(cm[0][0]), "predicted_1": int(cm[0][1])},
+        "true_1": {"predicted_0": int(cm[1][0]), "predicted_1": int(cm[1][1])},
+    }
+
+# Se ejecuta el pipeline completo en pasos de preprocesamiento, entrenamiento y evaluación
+def execute_pipeline():
+    test_data, train_data = [preprocess_dataframe(df) for df in load_dataset("files/input")]
+    
+    x_train, y_train = split_features_target(train_data)
+    x_test, y_test = split_features_target(test_data)
+    
+    pipeline = build_pipeline()
+    estimator = configure_estimator(pipeline)
+    estimator.fit(x_train, y_train)
+    
+    save_model("files/models/model.pkl.gz", estimator)
+    
+    create_output_folder("files/output/metrics/")
+    
+    y_test_pred = estimator.predict(x_test)
+    test_metrics = compute_metrics("test", y_test, y_test_pred)
+    train_metrics = compute_metrics("train", y_train, estimator.predict(x_train))
+    
+    test_confusion = compute_confusion_matrix("test", y_test, y_test_pred)
+    train_confusion = compute_confusion_matrix("train", y_train, estimator.predict(x_train))
+    
+    with open("files/output/metrics.json", "w", encoding="utf-8") as file:
+        file.write(json.dumps(train_metrics) + "\n")
+        file.write(json.dumps(test_metrics) + "\n")
+        file.write(json.dumps(train_confusion) + "\n")
+        file.write(json.dumps(test_confusion) + "\n")
+
+if __name__ == "__main__":
+    execute_pipeline()
